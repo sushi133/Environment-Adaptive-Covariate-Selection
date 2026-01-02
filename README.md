@@ -4,7 +4,7 @@
 
 The simulation folder includes all the code files and simulation results.
 
-## Bike Sharing and ACS Income Dataset
+## Bike Sharing and ACS Income Datasets
 
 The applied dataset folder includes all the code files and data analysis results.
 
