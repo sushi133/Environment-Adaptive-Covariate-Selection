@@ -1,7 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # EACS vs. baselines and Anchor/Oracle/ICP/Lasso on Bike Sharing
-# - Standardizes covariates per outer fold for ALL methods.
-# - Standardizes env summary vectors for selector families (LR/RF/NN).
 # ─────────────────────────────────────────────────────────────────────────────
 
 import os
@@ -68,9 +66,18 @@ class EnvDeepSetEmbed(nn.Module):
             nn.ReLU(),
         )
 
-    def forward(self, X):
+    def forward(self, X, mask=None):
+        """
+        X:   (B, N, p)
+        mask:(B, N, 1) with 1 for real samples and 0 for padded rows.
+        """
         h = self.phi(X)
-        pooled = h.mean(dim=1)
+        if mask is None:
+            pooled = h.mean(dim=1)
+        else:
+            mask = mask.to(h.dtype)
+            denom = mask.sum(dim=1).clamp(min=1.0)
+            pooled = (h * mask).sum(dim=1) / denom
         return self.rho(pooled)
 
 # ─── Load & preprocess ───────────────────────────────────────────────────────
@@ -90,7 +97,7 @@ print(f"• Number of features used: {len(feats)}")
 print("────────────────────────────────────────────────")
 
 # ─── Folds ───────────────────────────────────────────────────────────────────
-days  = df["dteday"].unique()
+days  = np.array(sorted(df["dteday"].unique()))
 folds = [list(chunk) for chunk in np.array_split(days, n_folds)]
 
 # ─── Feature subsets ─────────────────────────────────────────────────────────
@@ -110,7 +117,7 @@ def aligned_proba(estimator, x_row, K):
         p[int(cls)] = probs[i]
     return p
 
-# ─── Anchor (uses outer-fold standardized covariates, like all other methods) ─
+# ─── Anchor ───
 def fit_anchor(df_tr, g):
     days_tr = df_tr["dteday"].unique()
     Xd      = pd.get_dummies(
@@ -146,7 +153,7 @@ def anchor_fold_loss(df_tr, df_te, g):
     return df2.groupby("dteday")["loss"].mean().values
 
 def tune_anchor_gamma(df_tr, inner_splits, gamma_grid):
-    """Select Anchor gamma via inner CV on already-standardized outer-train data."""
+    """Select Anchor gamma via inner CV"""
     days_tr = df_tr["dteday"].unique()
     scores = []
     for g in gamma_grid:
@@ -178,9 +185,12 @@ def env_summary_stats(env, cols):
         pcorrs = []
         for i in range(p):
             for j in range(i+1,p):
-                den = np.sqrt(max(Omega[i,i]*Omega[j,j], 1e-12))
-                val = -Omega[i,j]/den if den>0 else 0.0
-                pcorrs.append(val)
+                denom = Omega[i,i] * Omega[j,j]
+                if denom <= 0 or not np.isfinite(denom):
+                    pcorrs.append(0.0)
+                else:
+                    val = -Omega[i,j] / np.sqrt(denom)
+                    pcorrs.append(val if np.isfinite(val) else 0.0)
     else:
         pcorrs = [0.0]*(p*(p-1)//2)
     return np.array(means + sds + pcorrs, dtype=float)
@@ -190,16 +200,30 @@ def build_env_batch(envs_list, idxs, Nmax=None):
     sets = [torch.tensor(envs_list[i][1][feats].values,
                          dtype=torch.float32)
             for i in idxs]
+    lengths = [x.shape[0] for x in sets]
+
     if Nmax is None:
-        Nmax = max(x.shape[0] for x in sets) if sets else 1
-    Xbat = torch.stack([F.pad(x, (0,0,0, Nmax-x.shape[0])) for x in sets])
-    return Xbat, Nmax
+        Nmax = max(lengths) if lengths else 1
+
+    if not sets:
+        Xbat = torch.zeros((0, Nmax, len(feats)), dtype=torch.float32)
+        mask = torch.zeros((0, Nmax, 1), dtype=torch.float32)
+        return Xbat, mask, Nmax
+
+    Xbat = torch.stack([F.pad(x, (0, 0, 0, Nmax - x.shape[0])) for x in sets])
+    mask = torch.stack([
+        F.pad(torch.ones((x.shape[0], 1), dtype=torch.float32),
+              (0, 0, 0, Nmax - x.shape[0]))
+        for x in sets
+    ])
+    return Xbat, mask, Nmax
 
 def train_deep_set_model(cfg, envs_list, y_labels, train_idx,
                          val_idx=None, max_epochs=30, patience=5):
     y_train = torch.tensor(y_labels[train_idx], device=DEVICE)
-    X_train, Nmax = build_env_batch(envs_list, train_idx)
+    X_train, M_train, Nmax = build_env_batch(envs_list, train_idx)
     X_train = X_train.to(DEVICE)
+    M_train = M_train.to(DEVICE)
 
     ds   = EnvDeepSetEmbed(len(feats), cfg["phi_hidden"],
                            cfg["rho_hidden"], cfg["embed_dim"]).to(DEVICE)
@@ -210,8 +234,9 @@ def train_deep_set_model(cfg, envs_list, y_labels, train_idx,
     has_val = val_idx is not None and len(val_idx) > 0
     if has_val:
         y_val = torch.tensor(y_labels[val_idx], device=DEVICE)
-        X_val, _ = build_env_batch(envs_list, val_idx, Nmax=Nmax)
+        X_val, M_val, _ = build_env_batch(envs_list, val_idx, Nmax=Nmax)
         X_val = X_val.to(DEVICE)
+        M_val = M_val.to(DEVICE)
 
     best_state = None
     best_val = float('inf')
@@ -220,7 +245,7 @@ def train_deep_set_model(cfg, envs_list, y_labels, train_idx,
     for _ in range(max_epochs):
         ds.train(); head.train()
         opt.zero_grad()
-        logits = head(ds(X_train))
+        logits = head(ds(X_train, M_train))
         loss = F.cross_entropy(logits, y_train)
         loss.backward()
         opt.step()
@@ -228,7 +253,7 @@ def train_deep_set_model(cfg, envs_list, y_labels, train_idx,
         if has_val:
             ds.eval(); head.eval()
             with torch.no_grad():
-                val_loss = F.cross_entropy(head(ds(X_val)), y_val).item()
+                val_loss = F.cross_entropy(head(ds(X_val, M_val)), y_val).item()
             if val_loss < best_val - 1e-6:
                 best_val = val_loss
                 best_state = (ds.state_dict(), head.state_dict())
@@ -247,10 +272,13 @@ def train_deep_set_model(cfg, envs_list, y_labels, train_idx,
 def mixture_mse(env_df, selector, baseline_models, name,
                 ds_mod=None, ds_head=None, Nmax=None, summ_scaler=None):
     if name == "DS":
-        x   = torch.tensor(env_df[feats].values,
-                           dtype=torch.float32).to(DEVICE)
-        pad = F.pad(x, (0,0,0, Nmax - x.shape[0])).unsqueeze(0)
-        probs = torch.softmax(ds_head(ds_mod(pad)), dim=1).detach().cpu().numpy()[0]
+        x = torch.tensor(env_df[feats].values,
+                         dtype=torch.float32).to(DEVICE)
+        n = x.shape[0]
+        pad = F.pad(x, (0, 0, 0, Nmax - n)).unsqueeze(0)
+        mask = torch.ones((n, 1), dtype=torch.float32, device=DEVICE)
+        mask = F.pad(mask, (0, 0, 0, Nmax - n)).unsqueeze(0)
+        probs = torch.softmax(ds_head(ds_mod(pad, mask)), dim=1).detach().cpu().numpy()[0]
     else:
         stats = env_summary_stats(env_df, feats)
         if summ_scaler is not None:
@@ -304,7 +332,7 @@ def icp_invariant(tr_data, alpha):
 
 # ─── Plot helpers ────────────────────────────────────────────────────────────
 def _clean_series_for_plot(cv_mses: dict) -> dict:
-    # Keep only EACS (Best) among EACS variants; drop empty series
+    # Keep only EACS (Best) among EACS variants
     cv = {k: v for k, v in cv_mses.items()
           if not (k.startswith('EACS (') and k != 'EACS (Best)')}
     cleaned = {}
@@ -327,7 +355,6 @@ def plot_results(cv_mses):
         print(f"  {m}: {mu:.4f} ± {sd:.4f}")
 
     def _display_label(m: str) -> str:
-        # Use a single label for the best EACS variant in the plot.
         if m == "EACS (Best)":
             return "EACS"
         if m.endswith("(baseline)"):
@@ -429,7 +456,7 @@ nested_mses_inner = []
 oracle_mses            = []
 baseline_mses          = {tuple(sub): [] for sub in all_subsets}
 lasso_mses             = []
-best_eacs_p            = []  # unused, kept for structure
+best_eacs_p            = []  
 best_lr_mses           = []
 best_nn_mses           = []
 best_rf_mses           = []
@@ -673,8 +700,11 @@ for i, te_days in enumerate(folds, start=1):
             # hard
             x = torch.tensor(env_df[feats].values,
                              dtype=torch.float32).to(DEVICE)
-            pad = F.pad(x, (0,0,0, Nmax_tr - x.shape[0])).unsqueeze(0)
-            k = int(torch.argmax(ds_head(ds_mod(pad)), dim=1).item())
+            n = x.shape[0]
+            pad = F.pad(x, (0, 0, 0, Nmax_tr - n)).unsqueeze(0)
+            mask = torch.ones((n, 1), dtype=torch.float32, device=DEVICE)
+            mask = F.pad(mask, (0, 0, 0, Nmax_tr - n)).unsqueeze(0)
+            k = int(torch.argmax(ds_head(ds_mod(pad, mask)), dim=1).item())
             sub = all_subsets[k]
             Xsub = env_df[list(sub)].values if sub else np.zeros((len(env_df),0))
             pred = baseline_cv[tuple(sub)].predict(Xsub)
@@ -744,8 +774,11 @@ for i, te_days in enumerate(folds, start=1):
     for _, env in te.groupby("dteday"):
         x = torch.tensor(env[feats].values,
                          dtype=torch.float32).to(DEVICE)
-        pad = F.pad(x, (0,0,0, Nmax_ds - x.shape[0])).unsqueeze(0)
-        k = int(torch.argmax(ds_head(ds_model(pad)), dim=1).item())
+        n = x.shape[0]
+        pad = F.pad(x, (0, 0, 0, Nmax_ds - n)).unsqueeze(0)
+        mask = torch.ones((n, 1), dtype=torch.float32, device=DEVICE)
+        mask = F.pad(mask, (0, 0, 0, Nmax_ds - n)).unsqueeze(0)
+        k = int(torch.argmax(ds_head(ds_model(pad, mask)), dim=1).item())
         sub = all_subsets[k]
         Xsub = env[list(sub)].values if sub else np.zeros((len(env),0))
         det_ds.append(

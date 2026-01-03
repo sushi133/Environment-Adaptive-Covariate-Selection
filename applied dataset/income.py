@@ -1,7 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # EACS (with DS/NN gates) vs OLS/Lasso/Anchor on ACS income
-# - Covariates standardized per outer fold for ALL methods.
-# - Env summaries standardized for summary-MLP gate.
 # ─────────────────────────────────────────────────────────────────────────────
 
 import os
@@ -112,7 +110,7 @@ p_feat = len(feats)
 
 # ─── Env folds ───────────────────────────────────────────────────────────────
 n_folds = 5
-days = np.array(df[ENV_COL].unique())
+days = np.array(sorted(df[ENV_COL].unique()))
 fold_sz = np.linspace(0, len(days), n_folds + 1, dtype=int)
 folds = [days[fold_sz[i] : fold_sz[i + 1]] for i in range(n_folds)]
 
@@ -207,8 +205,7 @@ class GateMLPLogits(nn.Module):
         return self.mlp(ctx)
 
 def soft_mask_from_logits(a: torch.Tensor, temp: float) -> torch.Tensor:
-    """Clamp logits and return sigmoid(a/temp)."""
-    a = a.clamp(-8.0, 8.0)
+    """Return sigmoid(a/temp)."""
     return torch.sigmoid(a / float(temp))
 
 # ─── Anchor regression ──────────────────────────────────────────────────────
@@ -256,7 +253,7 @@ def tune_anchor_gamma(df_tr: pd.DataFrame,
                       inner_splits,
                       gamma_grid: np.ndarray,
                       features):
-    """Select Anchor gamma via inner CV on already outer-standardized data."""
+    """Select Anchor gamma via inner CV"""
     days_tr = df_tr[ENV_COL].unique()
     scores = []
     for g in gamma_grid:
@@ -313,7 +310,6 @@ _PLOT_TIEBREAK = {
 }
 
 def _plot_order(methods, means):
-    """Sort by mean MSE, breaking ties by a fixed method priority."""
     return sorted(
         range(len(methods)),
         key=lambda i: (float(means[i]), _PLOT_TIEBREAK.get(methods[i], 999)),
@@ -411,7 +407,7 @@ for i, te_days in enumerate(folds, start=1):
     anchor_mses.append(outer_mse_anchor)
     anchor_gammas.append(best_g)
 
-    # ── Lasso (standardized wrt outer-train) ──────────────────────────────
+    # ── Lasso ──────────────────────────────
 
     alpha_grid = [1e-3, 1e-2, 1e-1, 1.0]
     alpha_mses = []
@@ -446,8 +442,7 @@ for i, te_days in enumerate(folds, start=1):
         ])
     )
 
-    # ── OLS baseline (standardized wrt outer-train) ───────────────────────
-    # Reuse the outer-fold scaler so OLS is standardized identically.
+    # ── OLS baseline ───────────────────────
     feat_scaler = fold_scaler
     X_cache_scaled_for_ols = {
         d: torch.tensor(feat_scaler.transform(X_cache_orig[d].cpu().numpy()),
@@ -467,11 +462,9 @@ for i, te_days in enumerate(folds, start=1):
     ])
     ols_mses.append(mse_ols)
 
-    # ── EACS caches (scaled wrt outer-train) ───────────────────────────────
-    # Reuse the outer-fold scaler so EACS uses the same standardized covariates.
+    # ── EACS ───────────────────────────────
     ds_scaler = fold_scaler
 
-    # Scale each environment once (using the outer-fold scaler) and compute u_e
     X_cache_scaled = {}
     stats_cache_unscaled = {}
     for d in days:
@@ -483,7 +476,7 @@ for i, te_days in enumerate(folds, start=1):
             X_scaled_np, alpha_max=0.3
         )
 
-    # Standardize summary coordinates across outer-training environments only,
+    # Standardize summary coordinates across outer-training environments
     u_scaler = StandardScaler().fit(
         np.vstack([stats_cache_unscaled[d] for d in tr_days]).astype(float)
     )
