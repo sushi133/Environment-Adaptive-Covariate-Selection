@@ -1,11 +1,7 @@
-# Environment-Adaptive Covariate Selection: Learning When to Use Spurious Correlations for Out-of-Distribution Prediction
-
-## Simulation
-
-The simulation folder includes all the code files and simulation results.
-
 ## Bike Sharing and ACS Income Datasets
 
-The applied dataset folder includes all the code files and data analysis results.
+The bike sharing dataset (hour.csv) is from https://archive.ics.uci.edu/ml/datasets/Bike+Sharing+Dataset.
+
+The ACS Income dataset (preprocessed_income_2018.csv) is obtained by running the preprocessing code from https://github.com/yujinj/OOD-generalization/blob/main/preprocess-data.ipynb.
 
 
