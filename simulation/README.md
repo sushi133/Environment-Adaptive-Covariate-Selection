@@ -1,11 +1,8 @@
-# Environment-Adaptive Covariate Selection: Learning When to Use Spurious Correlations for Out-of-Distribution Prediction
-
 ## Simulation
 
-The simulation folder includes all the code files and simulation results.
+This folder contains code and outputs for the simulation studies in the paper.
+The code directory includes Python scripts to run the simulations, while result, figure, and table store cached results, generated figures, and summary tables, respectively.
 
-## Bike Sharing and ACS Income Datasets
 
-The applied dataset folder includes all the code files and data analysis results.
 
 
