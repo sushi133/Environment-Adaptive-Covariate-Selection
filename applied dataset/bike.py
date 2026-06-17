@@ -1,8 +1,14 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# EACS vs. baselines and Anchor/Oracle/ICP/Lasso on Bike Sharing
+# Bike Sharing analysis 
 # ─────────────────────────────────────────────────────────────────────────────
 
 import os
+
+_N_THREADS = os.environ.get("N_THREADS", str(os.cpu_count() or 1))
+for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+           "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_v, _N_THREADS)
+
 import sys
 import random
 import numpy as np
@@ -14,12 +20,12 @@ from itertools import combinations
 
 from sklearn.base import clone
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LinearRegression, Lasso, LogisticRegression
+from sklearn.linear_model import LinearRegression, Lasso, LogisticRegression, Ridge
 from sklearn.dummy import DummyRegressor
 from sklearn.model_selection import KFold
 from sklearn.metrics import mean_squared_error
 from sklearn.neural_network import MLPClassifier
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from scipy import linalg as la
 from scipy.stats import f as fdist
 
@@ -27,6 +33,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+
+torch.set_num_threads(int(_N_THREADS))
 
 # ─── Reproducibility / Seeding ───────────────────────────────────────────────
 SEED = 0
@@ -47,7 +55,12 @@ INNER_CV   = 3   # inner CV folds
 gamma_grid = np.array([0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0])
 feats      = ["temp","atemp","hum","windspeed"]
 
-PICKLE_PATH = 'bike_res.pkl'
+# Output paths (one run writes all of these).
+PICKLE_PATH          = 'bike_res.pkl'
+FIG_PATH             = 'bike_res.png'
+ALL_RESULTS_CSV_PATH = 'bike_all_results_summary.csv'
+SUPP_TABLE_CSV_PATH  = 'bike_env_aug_supp_table.csv'
+SUPP_TABLE_TEX_PATH  = 'bike_env_aug_supp_table.tex'
 
 # ─── DeepSet embedder ───────────────────────────────────────────────────────
 class EnvDeepSetEmbed(nn.Module):
@@ -195,6 +208,168 @@ def env_summary_stats(env, cols):
         pcorrs = [0.0]*(p*(p-1)//2)
     return np.array(means + sds + pcorrs, dtype=float)
 
+
+
+def _fit_env_summary_scaler(data: pd.DataFrame, env_days) -> StandardScaler:
+    """Fit a scaler for environment summaries using only the supplied days."""
+    stats = []
+    for d in env_days:
+        env = data[data["dteday"] == d]
+        if len(env) == 0:
+            continue
+        stats.append(env_summary_stats(env, feats))
+    if len(stats) == 0:
+        raise ValueError("No environments available to fit summary scaler.")
+    return StandardScaler().fit(np.vstack(stats).astype(float))
+
+
+def _build_env_augmented_design(data: pd.DataFrame,
+                                summary_scaler: StandardScaler,
+                                include_interactions: bool = False):
+    """Construct row-level design for env-augmented ERM baselines.
+
+    Each row gets [X_i, u_e]. If include_interactions=True, append vec(X_i ⊗ u_e).
+    Rows are given weights so that each environment contributes equally to training.
+    """
+    X_blocks, y_blocks, w_blocks = [], [], []
+    for _, env in data.groupby("dteday", sort=False):
+        X = env[feats].values.astype(float)
+        y = env["cnt"].values.astype(float)
+        u = summary_scaler.transform(env_summary_stats(env, feats).reshape(1, -1))[0]
+        U = np.tile(u.reshape(1, -1), (X.shape[0], 1))
+        if include_interactions:
+            XU = (X[:, :, None] * U[:, None, :]).reshape(X.shape[0], -1)
+            X_aug = np.hstack([X, U, XU])
+        else:
+            X_aug = np.hstack([X, U])
+        X_blocks.append(X_aug)
+        y_blocks.append(y)
+        w_blocks.append(np.full(X.shape[0], 1.0 / max(1, X.shape[0]), dtype=float))
+    return np.vstack(X_blocks), np.concatenate(y_blocks), np.concatenate(w_blocks)
+
+
+def _env_augmented_mse(model,
+                       data: pd.DataFrame,
+                       summary_scaler: StandardScaler,
+                       include_interactions: bool = False) -> float:
+    """Average per-environment MSE for an env-augmented predictor."""
+    vals = []
+    for _, env in data.groupby("dteday", sort=False):
+        X_aug, y, _ = _build_env_augmented_design(
+            env, summary_scaler, include_interactions=include_interactions
+        )
+        vals.append(mean_squared_error(y, model.predict(X_aug)))
+    return float(np.mean(vals))
+
+
+RF_REG_PARAM_GRID = [
+    {"max_depth": None, "min_samples_leaf": 1, "max_features": "sqrt"},
+    {"max_depth": None, "min_samples_leaf": 5, "max_features": "sqrt"},
+    {"max_depth": 10,   "min_samples_leaf": 1, "max_features": "sqrt"},
+    {"max_depth": 10,   "min_samples_leaf": 5, "max_features": "sqrt"},
+    {"max_depth": None, "min_samples_leaf": 5, "max_features": 1.0},
+]
+
+
+def _build_x_only_design(data: pd.DataFrame):
+    """Construct row-level X-only design with environment-balanced sample weights."""
+    X_blocks, y_blocks, w_blocks = [], [], []
+    for _, env in data.groupby("dteday", sort=False):
+        X = env[feats].values.astype(float)
+        y = env["cnt"].values.astype(float)
+        X_blocks.append(X)
+        y_blocks.append(y)
+        w_blocks.append(np.full(X.shape[0], 1.0 / max(1, X.shape[0]), dtype=float))
+    return np.vstack(X_blocks), np.concatenate(y_blocks), np.concatenate(w_blocks)
+
+
+def _x_only_mse(model, data: pd.DataFrame) -> float:
+    """Average per-environment MSE for an X-only row-level predictor."""
+    vals = []
+    for _, env in data.groupby("dteday", sort=False):
+        vals.append(
+            mean_squared_error(
+                env["cnt"].values.astype(float),
+                model.predict(env[feats].values.astype(float)),
+            )
+        )
+    return float(np.mean(vals))
+
+
+def _rf_reg(**params):
+    """RandomForestRegressor with the shared fixed settings."""
+    return RandomForestRegressor(n_estimators=200, random_state=SEED,
+                                 n_jobs=-1, **params)
+
+
+def _inner_fold_frames(tr, days_tr, inner_splits_days):
+    """Yield (tr_in, va_in, train_days) for each inner split."""
+    for train_idx, val_idx in inner_splits_days:
+        dtr = days_tr[train_idx]
+        yield (tr[tr["dteday"].isin(dtr)],
+               tr[tr["dteday"].isin(days_tr[val_idx])],
+               dtr)
+
+
+def tune_rf_x(tr, te, days_tr, inner_splits_days):
+    """Random forest on X only (isolates the value of u_e)."""
+    # Build each inner-fold design once and reuse it across the grid.
+    folds = [(_build_x_only_design(tr_in), va_in)
+             for tr_in, va_in, _ in _inner_fold_frames(tr, days_tr, inner_splits_days)]
+    best = {"mse": np.inf, "params": None}
+    for params in RF_REG_PARAM_GRID:
+        vals = [_x_only_mse(_rf_reg(**params).fit(Xtr, ytr, sample_weight=wtr), va_in)
+                for (Xtr, ytr, wtr), va_in in folds]
+        mse = float(np.mean(vals))
+        if mse < best["mse"]:
+            best = {"mse": mse, "params": params}
+
+    Xtr, ytr, wtr = _build_x_only_design(tr)
+    final = _rf_reg(**best["params"]).fit(Xtr, ytr, sample_weight=wtr)
+    return _x_only_mse(final, te), best["params"], best["mse"]
+
+
+def _tune_env_augmented(tr, te, days_tr, inner_splits_days,
+                        make_model, grid, interactions):
+    """Shared inner-CV tuner for RF-Aug / Ridge-Int.
+
+    Designs (and summary scalers) are built once per inner fold and reused
+    across the grid value, since they depend only on the fold.
+    """
+    folds = []
+    for tr_in, va_in, dtr in _inner_fold_frames(tr, days_tr, inner_splits_days):
+        ss = _fit_env_summary_scaler(tr_in, dtr)
+        folds.append((_build_env_augmented_design(tr_in, ss, interactions), va_in, ss))
+
+    best = {"mse": np.inf, "value": None}
+    for value in grid:
+        vals = [_env_augmented_mse(make_model(value).fit(Xtr, ytr, sample_weight=wtr),
+                                   va_in, ss, interactions)
+                for (Xtr, ytr, wtr), va_in, ss in folds]
+        mse = float(np.mean(vals))
+        if mse < best["mse"]:
+            best = {"mse": mse, "value": value}
+
+    ss = _fit_env_summary_scaler(tr, days_tr)
+    Xtr, ytr, wtr = _build_env_augmented_design(tr, ss, interactions)
+    final = make_model(best["value"]).fit(Xtr, ytr, sample_weight=wtr)
+    return _env_augmented_mse(final, te, ss, interactions), best["value"], best["mse"]
+
+
+def tune_rf_augmented(tr, te, days_tr, inner_splits_days):
+    """Random forest on augmented row-level features (X, u_e)."""
+    return _tune_env_augmented(tr, te, days_tr, inner_splits_days,
+                               lambda p: _rf_reg(**p), RF_REG_PARAM_GRID,
+                               interactions=False)
+
+
+def tune_ridge_interaction(tr, te, days_tr, inner_splits_days):
+    """Ridge regression on [X, u_e, X ⊗ u_e]."""
+    return _tune_env_augmented(tr, te, days_tr, inner_splits_days,
+                               lambda a: Ridge(alpha=a),
+                               [1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0],
+                               interactions=True)
+
 # ─── DeepSet helpers ────────────────────────────────────────────────────────
 def build_env_batch(envs_list, idxs, Nmax=None):
     sets = [torch.tensor(envs_list[i][1][feats].values,
@@ -331,10 +506,13 @@ def icp_invariant(tr_data, alpha):
     return sorted(set.intersection(*passing)) if passing else []
 
 # ─── Plot helpers ────────────────────────────────────────────────────────────
+EXCLUDE_FROM_MAIN_PLOT = {"RF-X", "RF-Aug", "Ridge-Int"}
+
+
 def _clean_series_for_plot(cv_mses: dict) -> dict:
-    # Keep only EACS (Best) among EACS variants
     cv = {k: v for k, v in cv_mses.items()
-          if not (k.startswith('EACS (') and k != 'EACS (Best)')}
+          if not (k.startswith('EACS (') and k != 'EACS (Best)')
+          and k not in EXCLUDE_FROM_MAIN_PLOT}
     cleaned = {}
     for k, v in cv.items():
         arr = np.array([x for x in v if np.isfinite(x)], dtype=float)
@@ -373,6 +551,8 @@ def plot_results(cv_mses):
             return "purple"
         if m == "ICP":
             return "red"
+        if m in {"RF-X", "RF-Aug", "Ridge-Int"}:
+            return "black"
         if m.endswith("(baseline)"):
             return "gray"
         return "gray"
@@ -387,10 +567,12 @@ def plot_results(cv_mses):
             return 2
         if m == "Lasso":
             return 3
-        if m.endswith("(baseline)"):
+        if m in {"RF-X", "RF-Aug", "Ridge-Int"}:
             return 4
-        if m == "ICP":
+        if m.endswith("(baseline)"):
             return 5
+        if m == "ICP":
+            return 6
         return 999
 
     order = sorted(
@@ -403,7 +585,6 @@ def plot_results(cv_mses):
 
     y_labels = [_display_label(m) for m in methods]
 
-    # Scale-aware x-offset for the numeric annotations
     xmin = min(mu - sd for mu, sd in zip(means, stds))
     xmax = max(mu + sd for mu, sd in zip(means, stds))
     xoff = max(0.002, 0.02 * (xmax - xmin))
@@ -434,15 +615,158 @@ def plot_results(cv_mses):
     plt.xlabel("MSE (±1 SD)")
     plt.gca().invert_yaxis()
     plt.tight_layout()
+    plt.savefig(FIG_PATH, dpi=200, bbox_inches="tight")
+    print("➡️ Wrote main figure to", FIG_PATH)
     plt.show()
 
 
+
+def _finite_stats(vals):
+    arr = np.array([x for x in vals if np.isfinite(x)], dtype=float)
+    if arr.size == 0:
+        return None
+    return {
+        "mean_mse": float(arr.mean()),
+        "sd_mse": float(arr.std()),
+        "n_folds": int(arr.size),
+        "mse_sd": f"{arr.mean():.3f} ({arr.std():.3f})",
+    }
+
+
+def _display_method_for_table(method: str) -> str:
+    if method == "EACS (Best)":
+        return "EACS"
+    if method.endswith("(baseline)"):
+        feat_str = method.replace(" (baseline)", "")
+        return f"Fixed subset ({feat_str})"
+    return method
+
+
+def build_full_summary_df(cv_mses: dict) -> pd.DataFrame:
+    rows = []
+    for method, vals in cv_mses.items():
+        stats = _finite_stats(vals)
+        if stats is None:
+            continue
+        rows.append({
+            "method": method,
+            "display_method": _display_method_for_table(method),
+            **stats,
+        })
+    return pd.DataFrame(rows).sort_values("mean_mse").reset_index(drop=True)
+
+
+def build_supplement_table_df(cv_mses: dict) -> pd.DataFrame:
+    """Compact table for the environment-augmented ERM robustness check."""
+    baseline_keys = [k for k in cv_mses if k.endswith("(baseline)")]
+    best_baseline_key = None
+    if baseline_keys:
+        best_baseline_key = min(
+            baseline_keys,
+            key=lambda k: _finite_stats(cv_mses[k])["mean_mse"],
+        )
+
+    ordered_methods = ["Oracle", "RF-X", "RF-Aug", "EACS (Best)"]
+    if best_baseline_key is not None:
+        ordered_methods.append(best_baseline_key)
+    ordered_methods.append("Ridge-Int")
+
+    rows = []
+    for method in ordered_methods:
+        if method not in cv_mses:
+            continue
+        stats = _finite_stats(cv_mses[method])
+        if stats is None:
+            continue
+        if method == best_baseline_key:
+            subset = method.replace(" (baseline)", "")
+            display = "Best fixed subset"
+            detail = subset
+        elif method == "EACS (Best)":
+            display = "EACS"
+            detail = "adaptive subset selector"
+        elif method == "RF-X":
+            display = "RF-X"
+            detail = "random forest on X only"
+        elif method == "RF-Aug":
+            display = "RF-Aug"
+            detail = "random forest on (X, u_e)"
+        elif method == "Ridge-Int":
+            display = "Ridge-Int"
+            detail = "ridge on X, u_e, and X ⊗ u_e"
+        else:
+            display = method
+            detail = ""
+        rows.append({
+            "dataset": "Bike-sharing",
+            "method": display,
+            "detail": detail,
+            **stats,
+        })
+    return pd.DataFrame(rows)
+
+
+def _latex_escape_cell(x) -> str:
+    text = str(x)
+    replacements = {
+        "\\": r"\textbackslash{}",
+        "&": r"\&",
+        "%": r"\%",
+        "#": r"\#",
+        "_": r"\_",
+        "{": r"\{",
+        "}": r"\}",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    text = text.replace("⊗", r"$\otimes$")
+    return text
+
+
+def _write_latex_table(df: pd.DataFrame, path: str) -> None:
+    cols = ["method", "detail", "mse_sd"]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("% Auto-generated by bike.py\n")
+        f.write("\\begin{tabular}{lll}\n")
+        f.write("\\toprule\n")
+        f.write("Method & Detail & MSE (SD) " + r"\\" + "\n")
+        f.write("\\midrule\n")
+        for _, row in df[cols].iterrows():
+            method = _latex_escape_cell(row["method"])
+            detail = _latex_escape_cell(row["detail"])
+            mse_sd = _latex_escape_cell(row["mse_sd"])
+            f.write(f"{method} & {detail} & {mse_sd} " + r"\\" + "\n")
+        f.write("\\bottomrule\n")
+        f.write("\\end{tabular}\n")
+
+
+def write_summary_outputs(cv_mses: dict) -> None:
+    full_df = build_full_summary_df(cv_mses)
+    full_df.to_csv(ALL_RESULTS_CSV_PATH, index=False)
+    print("➡️ Wrote full summary table to", ALL_RESULTS_CSV_PATH)
+
+    supp_df = build_supplement_table_df(cv_mses)
+    supp_df.to_csv(SUPP_TABLE_CSV_PATH, index=False)
+    _write_latex_table(supp_df, SUPP_TABLE_TEX_PATH)
+    print("➡️ Wrote supplement table to", SUPP_TABLE_CSV_PATH)
+    print("➡️ Wrote supplement LaTeX table to", SUPP_TABLE_TEX_PATH)
+    print("\nSupplement table preview:")
+    print(supp_df[["method", "detail", "mse_sd"]].to_string(index=False))
+
+
 def try_load_and_plot():
+    """Regenerate paper outputs from a cached results pickle without recomputing."""
+    if os.environ.get("FORCE_RECOMPUTE") == "1":
+        return False
     if not os.path.exists(PICKLE_PATH):
         return False
     with open(PICKLE_PATH, "rb") as f:
         data = pickle.load(f)
-    plot_results(data["cv_mses"])
+    cv = data.get("cv_mses", {})
+    if not {"RF-X", "RF-Aug", "Ridge-Int"}.issubset(cv):
+        return False
+    write_summary_outputs(cv)
+    plot_results(cv)
     return True
 
 if try_load_and_plot():
@@ -456,7 +780,6 @@ nested_mses_inner = []
 oracle_mses            = []
 baseline_mses          = {tuple(sub): [] for sub in all_subsets}
 lasso_mses             = []
-best_eacs_p            = []  
 best_lr_mses           = []
 best_nn_mses           = []
 best_rf_mses           = []
@@ -467,6 +790,12 @@ best_nn_outer_mses     = []
 best_rf_outer_mses     = []
 best_ds_outer_mses     = []
 icp_tuned_mses         = []
+rf_x_mses              = []
+rf_aug_mses            = []
+ridge_int_mses         = []
+rf_x_cfgs              = []
+rf_aug_cfgs            = []
+ridge_int_alphas       = []
 
 for i, te_days in enumerate(folds, start=1):
     tr = df[~df["dteday"].isin(te_days)].copy()
@@ -556,6 +885,25 @@ for i, te_days in enumerate(folds, start=1):
     summ_scaler = StandardScaler().fit(X_env_all.astype(float))
     X_env_all   = summ_scaler.transform(X_env_all.astype(float))
 
+    # 2a) Environment-augmented ERM baselines.
+    # These use the same hand-crafted u_e as the summary-based EACS selectors,
+    # but learn a direct row-level predictor f(X_i,e, u_e).
+    rf_x_mse, rf_x_params, rf_x_inner = tune_rf_x(
+        tr, te, days_tr, inner_splits_days
+    )
+    rf_aug_mse, rf_aug_params, rf_aug_inner = tune_rf_augmented(
+        tr, te, days_tr, inner_splits_days
+    )
+    ridge_int_mse, ridge_int_alpha, ridge_int_inner = tune_ridge_interaction(
+        tr, te, days_tr, inner_splits_days
+    )
+    rf_x_mses.append(rf_x_mse)
+    rf_aug_mses.append(rf_aug_mse)
+    ridge_int_mses.append(ridge_int_mse)
+    rf_x_cfgs.append(rf_x_params)
+    rf_aug_cfgs.append(rf_aug_params)
+    ridge_int_alphas.append(ridge_int_alpha)
+
     y_env_all = np.array([
         int(np.argmin([
             mean_squared_error(
@@ -600,7 +948,6 @@ for i, te_days in enumerate(folds, start=1):
         base = LogisticRegression(
             C=C,
             penalty="l2",
-            multi_class="multinomial",
             solver="lbfgs",
             max_iter=2000,
             class_weight="balanced"
@@ -616,7 +963,6 @@ for i, te_days in enumerate(folds, start=1):
     model_lr = LogisticRegression(
         C=lr_best['C'],
         penalty="l2",
-        multi_class="multinomial",
         solver="lbfgs",
         max_iter=2000,
         class_weight="balanced"
@@ -865,6 +1211,12 @@ for i, te_days in enumerate(folds, start=1):
     print(f"Anchor: γ={g:.4f}, outer‑CV MSE={outer_mse:.4f}")
     print(f"Oracle: outer‑CV MSE={oracle_mses[-1]:.4f}")
     print(f"Lasso:  {lasso_hp}, outer‑CV MSE={lasso_mses[-1]:.4f}")
+    print(f"RF-X:   params={rf_x_params}, outer‑CV MSE={rf_x_mse:.4f}, "
+          f"inner‑CV MSE={rf_x_inner:.4f}")
+    print(f"RF-Aug: params={rf_aug_params}, outer‑CV MSE={rf_aug_mse:.4f}, "
+          f"inner‑CV MSE={rf_aug_inner:.4f}")
+    print(f"Ridge-Int: alpha={ridge_int_alpha}, outer‑CV MSE={ridge_int_mse:.4f}, "
+          f"inner‑CV MSE={ridge_int_inner:.4f}")
     print(f"EACS (LR): mode={lr_mode}, {lr_hp}, outer‑CV MSE={lr_outer:.4f}, "
           f"inner‑CV MSE={lr_best['mse']:.4f}")
     print(f"EACS (NN): mode={nn_mode}, {nn_hp}, outer‑CV MSE={nn_outer:.4f}, "
@@ -881,6 +1233,9 @@ cv_mses = {
     'Oracle':        oracle_mses,
     'Anchor':        nested_mses,
     'Lasso':         lasso_mses,
+    'RF-X':          rf_x_mses,
+    'RF-Aug':        rf_aug_mses,
+    'Ridge-Int':     ridge_int_mses,
     'EACS (LR)':      best_lr_outer_mses,
     'EACS (NN)':      best_nn_outer_mses,
     'EACS (RF)':      best_rf_outer_mses,
@@ -892,10 +1247,17 @@ for sub, vals in baseline_mses.items():
     label = ", ".join(sub) if len(sub) > 0 else "intercept-only"
     cv_mses[f"{label} (baseline)"] = vals
 
-to_save = {'cv_mses': cv_mses}
+to_save = {
+    'cv_mses': cv_mses,
+    'rf_x_cfgs': rf_x_cfgs,
+    'rf_aug_cfgs': rf_aug_cfgs,
+    'ridge_int_alphas': ridge_int_alphas,
+}
 with open(PICKLE_PATH,'wb') as f:
     pickle.dump(to_save, f)
 print("➡️ Computed and saved metrics to", PICKLE_PATH)
+
+write_summary_outputs(cv_mses)
 
 plot_results(cv_mses)
 

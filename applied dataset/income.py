@@ -1,8 +1,14 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# EACS (with DS/NN gates) vs OLS/Lasso/Anchor on ACS income
+# ACS Income analysis 
 # ─────────────────────────────────────────────────────────────────────────────
 
 import os
+
+_N_THREADS = os.environ.get("N_THREADS", str(os.cpu_count() or 1))
+for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+           "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_v, _N_THREADS)
+
 import pickle
 import random
 
@@ -20,6 +26,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
+torch.set_num_threads(int(_N_THREADS))
+
 # ─── Seed / device ───────────────────────────────────────────────────────────
 SEED = 0
 random.seed(SEED)
@@ -33,7 +41,12 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ─── Data loading / preprocessing ────────────────────────────────────────────
 DATA_PATH = "preprocessed_income_2018.csv"
+# Output paths (one run writes all of these).
 PICKLE_PATH = "income_res.pkl"
+FIG_PATH = "income_res.png"
+ALL_RESULTS_CSV_PATH = "income_all_results_summary.csv"
+SUPP_TABLE_CSV_PATH = "income_env_aug_supp_table.csv"
+SUPP_TABLE_TEX_PATH = "income_env_aug_supp_table.tex"
 ENV_COL = "STATE"
 TARGET_COL = "LogIncome"
 
@@ -208,6 +221,37 @@ def soft_mask_from_logits(a: torch.Tensor, temp: float) -> torch.Tensor:
     """Return sigmoid(a/temp)."""
     return torch.sigmoid(a / float(temp))
 
+
+class EnvAugLinearInteraction(nn.Module):
+    """Penalized linear predictor on X, u_e, and X ⊗ u_e without materializing interactions.
+
+    y_hat = b + gamma^T u_e + X_i^T (beta + B u_e)
+
+    This is the scalable ACS analogue of a ridge regression on [X, u_e, X ⊗ u_e].
+    """
+
+    def __init__(self, p: int, q: int, bias_init: float = 0.0):
+        super().__init__()
+        self.bias = nn.Parameter(torch.tensor(float(bias_init), dtype=torch.float32))
+        self.beta = nn.Parameter(torch.zeros(p, dtype=torch.float32))
+        self.gamma = nn.Parameter(torch.zeros(q, dtype=torch.float32))
+        self.B = nn.Parameter(torch.zeros(p, q, dtype=torch.float32))
+
+    def forward_env(self, X: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        if u.ndim == 2:
+            u = u.squeeze(0)
+        env_coef = self.beta + torch.mv(self.B, u)
+        env_bias = self.bias + torch.dot(self.gamma, u)
+        return env_bias + torch.mv(X, env_coef)
+
+    def ridge_penalty(self) -> torch.Tensor:
+        # Mean-squared penalty keeps the tuning scale stable as p and q vary.
+        return (
+            self.beta.pow(2).mean()
+            + self.gamma.pow(2).mean()
+            + self.B.pow(2).mean()
+        )
+
 # ─── Anchor regression ──────────────────────────────────────────────────────
 def fit_anchor(df_tr: pd.DataFrame, g: float, features):
     days_tr = df_tr[ENV_COL].unique()
@@ -289,10 +333,17 @@ CLIP_NORM = 1.0
 # Anchor gamma grid
 gamma_grid = np.array([0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0])
 
+# Environment-augmented linear interaction baseline.
+RIDGE_INT_L2_GRID = [0.0, 1e-4, 1e-3, 1e-2, 1e-1]
+RIDGE_INT_LR = 1e-2
+RIDGE_INT_HYPER_EPOCHS = 60
+RIDGE_INT_FINAL_EPOCHS = 120
+
 # ─── Main training/eval ─────────────────────────────────────────────────────
 ols_mses = []
 lasso_alphas, lasso_mses = [], []
 anchor_gammas, anchor_mses = [], []
+ridge_int_l2s, ridge_int_inner_mses, ridge_int_mses = [], [], []
 eacs_cfgs, eacs_mses = [], []  # unified EACS results
 
 COLOR_MAP = {
@@ -300,6 +351,7 @@ COLOR_MAP = {
     "Anchor": "blue",
     "OLS": "gray",
     "Lasso": "purple",
+    "Ridge-Int": "black",
 }
 
 _PLOT_TIEBREAK = {
@@ -307,6 +359,7 @@ _PLOT_TIEBREAK = {
     "Anchor": 1,
     "OLS": 2,
     "Lasso": 3,
+    "Ridge-Int": 4,
 }
 
 def _plot_order(methods, means):
@@ -324,7 +377,6 @@ def plot_income_results(methods, means, stds):
 
     display_methods = methods
 
-    # Scale-aware x-offset for the numeric annotations
     xmin = min(mu - sd for mu, sd in zip(means, stds))
     xmax = max(mu + sd for mu, sd in zip(means, stds))
     xoff = max(0.002, 0.02 * (xmax - xmin))
@@ -357,6 +409,8 @@ def plot_income_results(methods, means, stds):
     margin = 0.4  
     ax.set_ylim(y_pos[-1] + margin, y_pos[0] - margin) 
     plt.tight_layout()
+    plt.savefig(FIG_PATH, dpi=200, bbox_inches="tight")
+    print("➡️ Wrote main figure to", FIG_PATH)
     plt.show()
 
 def print_summary(methods, means, stds):
@@ -365,22 +419,197 @@ def print_summary(methods, means, stds):
         print(f"  {m}: {mu:.4f} ± {sd:.4f}")
 
 
-# Try load existing results
-if os.path.exists(PICKLE_PATH):
+def _train_ridge_interaction_model(train_days,
+                                   X_src,
+                                   y_src,
+                                   u_src,
+                                   l2: float,
+                                   epochs: int,
+                                   lr: float,
+                                   bias_init: float) -> EnvAugLinearInteraction:
+    """Train the ACS env-augmented linear interaction baseline."""
+    model = EnvAugLinearInteraction(p_feat, dim_u, bias_init=bias_init).to(DEVICE)
+    opt = optim.Adam(model.parameters(), lr=lr)
+    train_days = list(train_days)
+
+    for _ in range(int(epochs)):
+        opt.zero_grad()
+        total_envs = len(train_days)
+        loss = 0.0
+        for d in train_days:
+            yhat = model.forward_env(X_src[d], u_src[d])
+            loss = loss + (1.0 / total_envs) * F.mse_loss(yhat, y_src[d])
+        loss = loss + float(l2) * model.ridge_penalty()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP_NORM)
+        opt.step()
+    return model
+
+
+def _eval_ridge_interaction_model(model: EnvAugLinearInteraction,
+                                  eval_days,
+                                  X_src,
+                                  y_src,
+                                  u_src) -> float:
+    """Environment-averaged MSE for the env-augmented interaction model."""
+    model.eval()
+    eval_days = list(eval_days)
+    with torch.no_grad():
+        total_envs = len(eval_days)
+        se = 0.0
+        for d in eval_days:
+            yhat = model.forward_env(X_src[d], u_src[d])
+            se += (1.0 / total_envs) * F.mse_loss(yhat, y_src[d]).item()
+    return float(se)
+
+
+def tune_ridge_interaction_summary(tr_days,
+                                   inner_splits_days,
+                                   X_src,
+                                   y_src,
+                                   u_src,
+                                   bias_init: float):
+    """Tune the penalized [X, u_e, X ⊗ u_e] baseline by environment-level CV."""
+    best_l2, best_score = None, float("inf")
+    tr_days = np.asarray(tr_days)
+    for l2 in RIDGE_INT_L2_GRID:
+        scores = []
+        for tr_idx, val_idx in inner_splits_days:
+            dtr = [tr_days[j] for j in tr_idx]
+            dval = [tr_days[j] for j in val_idx]
+            model = _train_ridge_interaction_model(
+                dtr, X_src, y_src, u_src,
+                l2=l2,
+                epochs=RIDGE_INT_HYPER_EPOCHS,
+                lr=RIDGE_INT_LR,
+                bias_init=bias_init,
+            )
+            scores.append(
+                _eval_ridge_interaction_model(model, dval, X_src, y_src, u_src)
+            )
+        score = float(np.mean(scores))
+        if score < best_score:
+            best_l2, best_score = float(l2), score
+
+    final_model = _train_ridge_interaction_model(
+        tr_days, X_src, y_src, u_src,
+        l2=best_l2,
+        epochs=RIDGE_INT_FINAL_EPOCHS,
+        lr=RIDGE_INT_LR,
+        bias_init=bias_init,
+    )
+    return final_model, best_l2, best_score
+
+
+def _finite_stats(vals):
+    arr = np.array([x for x in vals if np.isfinite(x)], dtype=float)
+    if arr.size == 0:
+        return None
+    return {
+        "mean_mse": float(arr.mean()),
+        "sd_mse": float(arr.std()),
+        "n_folds": int(arr.size),
+        "mse_sd": f"{arr.mean():.3f} ({arr.std():.3f})",
+    }
+
+
+def build_summary_df(fold_mses: dict) -> pd.DataFrame:
+    rows = []
+    for method, vals in fold_mses.items():
+        stats = _finite_stats(vals)
+        if stats is None:
+            continue
+        rows.append({"method": method, **stats})
+    return pd.DataFrame(rows).sort_values("mean_mse").reset_index(drop=True)
+
+
+def build_supplement_table_df(fold_mses: dict) -> pd.DataFrame:
+    # Compact ACS rows for the env-augmented ERM robustness check.
+    ordered_methods = ["EACS", "OLS", "Anchor", "Lasso", "Ridge-Int"]
+    details = {
+        "EACS": "soft gate",
+        "OLS": "linear model on X",
+        "Anchor": "state anchors",
+        "Lasso": "lasso on X",
+        "Ridge-Int": "bilinear ridge on X, u_e, and X ⊗ u_e",
+    }
+    rows = []
+    for method in ordered_methods:
+        if method not in fold_mses:
+            continue
+        stats = _finite_stats(fold_mses[method])
+        if stats is None:
+            continue
+        rows.append({
+            "dataset": "ACS income",
+            "method": method,
+            "detail": details.get(method, ""),
+            **stats,
+        })
+    return pd.DataFrame(rows)
+
+
+def _latex_escape_cell(x) -> str:
+    text = str(x)
+    replacements = {
+        "\\": r"\textbackslash{}",
+        "&": r"\&",
+        "%": r"\%",
+        "#": r"\#",
+        "_": r"\_",
+        "{": r"\{",
+        "}": r"\}",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    text = text.replace("⊗", r"$\otimes$")
+    return text
+
+
+def _write_latex_table(df: pd.DataFrame, path: str) -> None:
+    cols = ["method", "detail", "mse_sd"]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("% Auto-generated by income.py\n")
+        f.write("\\begin{tabular}{lll}\n")
+        f.write("\\toprule\n")
+        f.write("Method & Detail & MSE (SD) " + r"\\" + "\n")
+        f.write("\\midrule\n")
+        for _, row in df[cols].iterrows():
+            method = _latex_escape_cell(row["method"])
+            detail = _latex_escape_cell(row["detail"])
+            mse_sd = _latex_escape_cell(row["mse_sd"])
+            f.write(f"{method} & {detail} & {mse_sd} " + r"\\" + "\n")
+        f.write("\\bottomrule\n")
+        f.write("\\end{tabular}\n")
+
+
+def write_summary_outputs(fold_mses: dict) -> None:
+    full_df = build_summary_df(fold_mses)
+    full_df.to_csv(ALL_RESULTS_CSV_PATH, index=False)
+    print(f"➡️ Wrote full summary table to {ALL_RESULTS_CSV_PATH}")
+
+    supp_df = build_supplement_table_df(fold_mses)
+    supp_df.to_csv(SUPP_TABLE_CSV_PATH, index=False)
+    _write_latex_table(supp_df, SUPP_TABLE_TEX_PATH)
+    print(f"➡️ Wrote supplement table to {SUPP_TABLE_CSV_PATH}")
+    print(f"➡️ Wrote supplement LaTeX table to {SUPP_TABLE_TEX_PATH}")
+    print("\nSupplement table preview:")
+    print(supp_df[["method", "detail", "mse_sd"]].to_string(index=False))
+
+
+# Regenerate paper outputs from a cached results pickle without recomputing.
+if os.environ.get("FORCE_RECOMPUTE") != "1" and os.path.exists(PICKLE_PATH):
     with open(PICKLE_PATH, "rb") as f:
         saved = pickle.load(f)
-    methods, means, stds = saved["methods"], saved["means"], saved["stds"]
-    print(f"➡️ Loaded metrics from {PICKLE_PATH}")
-
-    order = np.argsort(means)
-    methods = [methods[i] for i in order]
-    means   = [means[i]   for i in order]
-    stds    = [stds[i]    for i in order]
-
-    print_summary(methods, means, stds)
-
-    plot_income_results(methods, means, stds)
-    raise SystemExit
+    fold_mses = saved.get("fold_mses")
+    if fold_mses is not None and "Ridge-Int" in fold_mses:
+        write_summary_outputs(fold_mses)
+        main_methods = [m for m in ["EACS", "Anchor", "OLS", "Lasso"] if m in fold_mses]
+        main_means = [float(np.mean(fold_mses[m])) for m in main_methods]
+        main_stds = [float(np.std(fold_mses[m])) for m in main_methods]
+        print_summary(main_methods, main_means, main_stds)
+        plot_income_results(main_methods, main_means, main_stds)
+        raise SystemExit
 
 # Fresh compute
 for i, te_days in enumerate(folds, start=1):
@@ -391,6 +620,8 @@ for i, te_days in enumerate(folds, start=1):
     # ── Outer-fold standardization (shared by ALL methods) ─────────────────
     fold_scaler = StandardScaler().fit(tr[feats].values.astype(float))
     tr_s, te_s = tr.copy(), te.copy()
+    tr_s[feats] = tr_s[feats].astype(float)
+    te_s[feats] = te_s[feats].astype(float)
     tr_s.loc[:, feats] = fold_scaler.transform(tr[feats].values.astype(float))
     te_s.loc[:, feats] = fold_scaler.transform(te[feats].values.astype(float))
 
@@ -490,6 +721,24 @@ for i, te_days in enumerate(folds, start=1):
     }
 
     bias_init = float(np.mean([y_cache[d].cpu().numpy().mean() for d in tr_days]))
+
+    # ── Environment-augmented linear interaction baseline ─────────────────
+    # Uses the same fixed summary u_e as the summary-MLP EACS gate, but learns
+    # a direct predictor f(X_i,e, u_e) = b + γ^T u_e + X_i,e^T(β + B u_e).
+    ridge_int_model, ridge_int_l2, ridge_int_inner = tune_ridge_interaction_summary(
+        tr_days,
+        inner_splits_days,
+        X_cache_scaled,
+        y_cache,
+        stats_cache_scaled,
+        bias_init=bias_init,
+    )
+    ridge_int_outer = _eval_ridge_interaction_model(
+        ridge_int_model, te_days, X_cache_scaled, y_cache, stats_cache_scaled
+    )
+    ridge_int_l2s.append(ridge_int_l2)
+    ridge_int_inner_mses.append(ridge_int_inner)
+    ridge_int_mses.append(ridge_int_outer)
 
     # ── EACS helper routines ───────────────────────────────────────────────
     def _warmup_head(head, train_days, X_src, y_src, steps):
@@ -683,32 +932,42 @@ for i, te_days in enumerate(folds, start=1):
           f"inner‑CV MSE={inner_best:.4f}")
     print(f"Lasso:  α={best_alpha}, outer‑CV MSE={lasso_mses[-1]:.4f}")
     print(f"OLS:    outer‑CV MSE={mse_ols:.4f}")
+    print(f"Ridge-Int: λ={ridge_int_l2:.4g}, outer‑CV MSE={ridge_int_outer:.4f}, "
+          f"inner‑CV MSE={ridge_int_inner:.4f}")
     print(f"EACS:    family={chosen_family}, outer‑CV MSE={eacs_mses[-1]:.4f}")
 
 # ─── Final summary / plot ───────────────────────────────────────────────────
-methods = ["EACS", "Lasso", "OLS", "Anchor"]
-means = [
-    float(np.mean(eacs_mses)),
-    float(np.mean(lasso_mses)),
-    float(np.mean(ols_mses)),
-    float(np.mean(anchor_mses)),
-]
-stds = [
-    float(np.std(eacs_mses)),
-    float(np.std(lasso_mses)),
-    float(np.std(ols_mses)),
-    float(np.std(anchor_mses)),
-]
+fold_mses = {
+    "EACS": eacs_mses,
+    "Lasso": lasso_mses,
+    "Ridge-Int": ridge_int_mses,
+    "OLS": ols_mses,
+    "Anchor": anchor_mses,
+}
 
-order = np.argsort(means)
-methods = [methods[i] for i in order]
-means   = [means[i]   for i in order]
-stds    = [stds[i]    for i in order]
+main_methods = ["EACS", "Lasso", "OLS", "Anchor"]
+main_means = [float(np.mean(fold_mses[m])) for m in main_methods]
+main_stds = [float(np.std(fold_mses[m])) for m in main_methods]
 
-print_summary(methods, means, stds)
+order = np.argsort(main_means)
+main_methods = [main_methods[i] for i in order]
+main_means   = [main_means[i]   for i in order]
+main_stds    = [main_stds[i]    for i in order]
+
+print_summary(main_methods, main_means, main_stds)
 
 with open(PICKLE_PATH, "wb") as f:
-    pickle.dump({"methods": methods, "means": means, "stds": stds}, f)
+    pickle.dump({
+        "methods": main_methods,
+        "means": main_means,
+        "stds": main_stds,
+        "fold_mses": fold_mses,
+        "ridge_int_l2s": ridge_int_l2s,
+        "ridge_int_inner_mses": ridge_int_inner_mses,
+        "eacs_cfgs": eacs_cfgs,
+    }, f)
 print(f"➡️ Computed and saved metrics to {PICKLE_PATH}")
 
-plot_income_results(methods, means, stds)
+write_summary_outputs(fold_mses)
+
+plot_income_results(main_methods, main_means, main_stds)

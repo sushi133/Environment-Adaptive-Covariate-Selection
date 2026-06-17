@@ -1,0 +1,6 @@
+dataset,method,detail,mean_mse,sd_mse,n_folds,mse_sd
+ACS income,EACS,soft gate,0.48252639082345095,0.01516146839175463,5,0.483 (0.015)
+ACS income,OLS,linear model on X,0.4941353810375387,0.014590558614699977,5,0.494 (0.015)
+ACS income,Anchor,state anchors,0.49392740880844804,0.014559554389620777,5,0.494 (0.015)
+ACS income,Lasso,lasso on X,0.4942490957668474,0.014508664623928913,5,0.494 (0.015)
+ACS income,Ridge-Int,"bilinear ridge on X, u_e, and X ⊗ u_e",1.2125620526075365,0.4124065916116638,5,1.213 (0.412)
